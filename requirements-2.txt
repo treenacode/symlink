@@ -1,3 +1,0 @@
-customtkinter
-tkinterdnd2
-Pillow
