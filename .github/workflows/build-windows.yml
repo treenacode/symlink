@@ -1,0 +1,54 @@
+# .github/workflows/build-windows.yml
+#
+# This workflow runs on GitHub's free Windows cloud machines.
+# It installs your dependencies, builds the .exe with PyInstaller,
+# and uploads it as a downloadable "artifact" you can grab from the Actions tab.
+#
+# HOW TO USE:
+#   1. Create a free account at https://github.com
+#   2. Create a new repository (can be private)
+#   3. Upload these files to the repo root:
+#        shortcut.py
+#        shortcut.ico
+#        shortcut.spec
+#        requirements.txt
+#        .github/workflows/build-windows.yml   ← this file (keep the folder structure)
+#   4. Go to your repo → Actions tab → "Build Windows EXE" → Run workflow
+#   5. Wait ~3-5 minutes, then download Shortcut.exe from the Artifacts section
+
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:        # Manual trigger from the Actions tab
+  push:
+    branches: [ main ]      # Also auto-builds whenever you push to main
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller shortcut.spec
+
+      - name: Upload EXE as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shortcut-Windows
+          path: dist/Shortcut.exe
+          retention-days: 30    # Download within 30 days
