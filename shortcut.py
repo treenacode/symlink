@@ -40,8 +40,40 @@ def get_file_info(path):
     return {"path": path, "inode": inode, "parent": os.path.dirname(path)}
 
 
+def _scan_dir_for_inode(directory, inode, max_scan=800, _count=None):
+    """Recursively scan a directory tree for a file/folder matching the given inode.
+    Stops after max_scan entries to avoid hanging on huge drives."""
+    if _count is None:
+        _count = [0]
+    try:
+        for entry in os.scandir(directory):
+            if _count[0] >= max_scan:
+                return None
+            _count[0] += 1
+            try:
+                if os.stat(entry.path).st_ino == inode:
+                    return entry.path
+                if entry.is_dir(follow_symlinks=False):
+                    result = _scan_dir_for_inode(entry.path, inode, max_scan, _count)
+                    if result:
+                        return result
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
 def resolve_file_path(file_entry):
-    """Return the current path for a file entry, searching by inode if needed."""
+    """Return the current path for a file entry.
+
+    Search strategy when the stored path no longer exists:
+    1. Scan the original parent directory (fast, catches renames in-place)
+    2. Walk UP the directory tree up to 4 ancestor levels and scan each
+       subtree (catches moves within the same general area, e.g. adding a
+       subfolder between the root and the file)
+    3. Return the stale path so callers can offer a manual relink.
+    """
     if isinstance(file_entry, str):
         return file_entry  # backward-compat with old string-only saves
 
@@ -52,20 +84,33 @@ def resolve_file_path(file_entry):
     if os.path.exists(path):
         return path
 
-    # Path no longer valid — scan the parent directory for matching inode
-    if inode and parent and os.path.isdir(parent):
-        try:
-            for entry in os.scandir(parent):
-                try:
-                    if os.stat(entry.path).st_ino == inode:
-                        file_entry["path"] = entry.path  # update cached path
-                        return entry.path
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    if not inode:
+        return path
 
-    return path  # return stale path if nothing found
+    # Walk upward through ancestor directories, scanning each subtree
+    search_dir = parent
+    for level in range(5):  # check up to 5 ancestor levels
+        if not search_dir or not os.path.isdir(search_dir):
+            break
+        found = _scan_dir_for_inode(search_dir, inode)
+        if found:
+            file_entry["path"] = found
+            file_entry["parent"] = os.path.dirname(found)
+            return found
+        # Move one level up
+        up = os.path.dirname(search_dir)
+        if up == search_dir:   # reached filesystem root
+            break
+        search_dir = up
+
+    return path  # stale — caller should offer manual relink
+
+
+def is_path_missing(file_entry):
+    """Return True if the file entry cannot be resolved to an existing path."""
+    resolved = resolve_file_path(file_entry)
+    return not os.path.exists(resolved)
+
 
 
 def normalize_file_list(files):
@@ -224,6 +269,8 @@ class EditorWindow(ctk.CTkToplevel):
 
         _btn = dict(height=26, corner_radius=5, width=100)
         ctk.CTkButton(btnf, text="Add Files", command=self.add_files, **_btn).pack(side="left")
+        ctk.CTkButton(btnf, text="Relink…", command=self.relink_selected,
+                      fg_color="#e07b00", hover_color="#b85f00", **_btn).pack(side="left", padx=(6, 0))
         ctk.CTkButton(btnf, text="Cancel", command=self.cancel,
                       fg_color="#888888", hover_color="#666666", **_btn).pack(side="right")
         ctk.CTkButton(btnf, text="Save & Close", command=self.on_close, **_btn).pack(side="right", padx=(0, 6))
@@ -271,8 +318,11 @@ class EditorWindow(ctk.CTkToplevel):
             resolved = resolve_file_path(f)
             name = os.path.basename(resolved)
             exists = os.path.exists(resolved)
-            display = name if exists else f"⚠ {name}  (missing — may have been renamed/moved)"
-            self.tree.insert("", "end", text=display, values=(resolved,))
+            display = name if exists else f"⚠ {name}  (not found — moved to another location?)"
+            tag = "missing" if not exists else ""
+            self.tree.insert("", "end", text=display, values=(resolved,), tags=(tag,))
+        # Style missing entries in red-ish
+        self.tree.tag_configure("missing", foreground="#cc3333")
 
     def add_files(self):
         paths = filedialog.askopenfilenames()
@@ -319,6 +369,51 @@ class EditorWindow(ctk.CTkToplevel):
         sel = self.tree.selection()
         if sel:
             open_file(self.tree.item(sel[0])["values"][0])
+
+    def relink_selected(self):
+        """Manually point a missing file/folder to its new location."""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Relink", "Select a file in the list first, then click Relink.")
+            return
+
+        iid = sel[0]
+        old_path = self.tree.item(iid)["values"][0]
+
+        if os.path.exists(old_path):
+            if not messagebox.askyesno("Relink", f"'{os.path.basename(old_path)}' still exists.\nRelink it to a different location anyway?"):
+                return
+
+        name = os.path.basename(old_path)
+        # Guess whether it's a folder (no extension) or file
+        is_folder = os.path.splitext(name)[1] == "" and not os.path.isfile(old_path)
+
+        if is_folder:
+            new_path = filedialog.askdirectory(title=f"Locate folder: {name}")
+        else:
+            new_path = filedialog.askopenfilename(
+                title=f"Locate file: {name}",
+                initialfile=name
+            )
+
+        if not new_path:
+            return
+
+        new_path = os.path.normpath(new_path)
+
+        # Update the entry in file_list
+        for f in self.file_list:
+            if resolve_file_path(f) == old_path or (isinstance(f, dict) and f.get("path") == old_path):
+                if isinstance(f, dict):
+                    f["path"] = new_path
+                    f["parent"] = os.path.dirname(new_path)
+                    try:
+                        f["inode"] = os.stat(new_path).st_ino
+                    except Exception:
+                        pass
+                break
+
+        self.refresh_list()
 
     def on_close(self):
         self.btn.data["files"] = self.file_list
@@ -574,7 +669,7 @@ class ShortcutButton(ctk.CTkButton):
             menu.add_command(label="Edit Files", command=self.open_editor)
             menu.add_command(label="Open All", command=self.open_all)
             menu.add_separator()
-            menu.add_command(label="🔗 Create Symlinks…", command=self.create_symlinks)
+            menu.add_command(label="Create Symlinks…", command=self.create_symlinks)
             menu.add_separator()
             menu.add_command(label="Delete", command=self.confirm_delete)
 
@@ -620,13 +715,38 @@ class ShortcutButton(ctk.CTkButton):
             messagebox.showinfo("No Files", f"'{self.data['name']}' has no files to open.")
             return
 
-        opened_count = 0
         for f in self.data["files"]:
+            resolved = resolve_file_path(f)
+            if not os.path.exists(resolved):
+                name = os.path.basename(resolved)
+                choice = messagebox.askyesno(
+                    "File Not Found",
+                    f"'{name}' could not be found automatically.\n\n"
+                    f"It may have been moved to a different drive or location.\n\n"
+                    f"Would you like to locate it manually?"
+                )
+                if choice:
+                    is_dir = os.path.splitext(name)[1] == ""  # rough guess
+                    if is_dir:
+                        new_path = filedialog.askdirectory(title=f"Locate: {name}")
+                    else:
+                        new_path = filedialog.askopenfilename(title=f"Locate: {name}")
+                    if new_path:
+                        new_path = os.path.normpath(new_path)
+                        if isinstance(f, dict):
+                            f["path"] = new_path
+                            f["parent"] = os.path.dirname(new_path)
+                            try:
+                                f["inode"] = os.stat(new_path).st_ino
+                            except Exception:
+                                pass
+                        self.app.save_data()
+                        open_file(new_path)
+                continue
             try:
-                open_file(resolve_file_path(f))
-                opened_count += 1
+                open_file(resolved)
             except Exception as e:
-                print(f"Error opening {f}: {e}")
+                print(f"Error opening {resolved}: {e}")
 
     def open_editor(self):
         EditorWindow(self.app.root, self, self.app)
@@ -891,28 +1011,28 @@ class ShortcutsApp:
         _tb_btn = dict(height=24, corner_radius=4, border_width=0)
 
         # Left side buttons
-        ctk.CTkButton(toolbar, text="＋ New", command=self.new_button_at_fixed_pos,
+        ctk.CTkButton(toolbar, text="+ New", command=self.new_button_at_fixed_pos,
                       width=64, **_tb_btn).pack(side="left", padx=(6, 2), pady=3)
 
         self.lock_button = ctk.CTkButton(
             toolbar,
-            text="🔓" if not self.buttons_locked else "🔒",
+            text="Unlocked" if not self.buttons_locked else "Locked",
             command=self.toggle_lock,
-            width=32,
+            width=68,
             fg_color="#2cc940" if not self.buttons_locked else "#d42c2c",
             **_tb_btn
         )
         self.lock_button.pack(side="left", padx=2, pady=3)
 
-        ctk.CTkButton(toolbar, text="🔤", command=self.show_font_settings,
-                      width=32, **_tb_btn).pack(side="left", padx=2, pady=3)
+        ctk.CTkButton(toolbar, text="Aa", command=self.show_font_settings,
+                      width=36, **_tb_btn).pack(side="left", padx=2, pady=3)
 
         # Right side buttons
-        ctk.CTkButton(toolbar, text="↩", command=self.undo,
+        ctk.CTkButton(toolbar, text="↺", command=self.undo,
                       width=30, **_tb_btn).pack(side="right", padx=(2, 6), pady=3)
-        ctk.CTkButton(toolbar, text="↪", command=self.redo,
+        ctk.CTkButton(toolbar, text="↻", command=self.redo,
                       width=30, **_tb_btn).pack(side="right", padx=2, pady=3)
-        ctk.CTkButton(toolbar, text="⌨", command=self.show_hotkeys,
+        ctk.CTkButton(toolbar, text="?", command=self.show_hotkeys,
                       width=30, **_tb_btn).pack(side="right", padx=2, pady=3)
 
         # Buttons frame — tighter padding for minimal feel
@@ -1023,10 +1143,10 @@ class ShortcutsApp:
         self.config["buttons_locked"] = self.buttons_locked
         
         if self.buttons_locked:
-            self.lock_button.configure(text="🔒", fg_color="#d42c2c")
+            self.lock_button.configure(text="Locked", fg_color="#d42c2c")
             self.root.configure(cursor="arrow")
         else:
-            self.lock_button.configure(text="🔓", fg_color="#2cc940")
+            self.lock_button.configure(text="Unlocked", fg_color="#2cc940")
             self.root.configure(cursor="arrow")
         
         # Save the state
@@ -1449,7 +1569,7 @@ class ShortcutsApp:
         menu.add_separator()
         
         # *** FREEZE FEATURE: Add to context menu ***
-        lock_text = "🔓 Unlock Buttons" if self.buttons_locked else "🔒 Lock Buttons"
+        lock_text = "Unlock Buttons" if self.buttons_locked else "Lock Buttons"
         menu.add_command(label=lock_text, command=self.toggle_lock)
         menu.add_separator()
         
